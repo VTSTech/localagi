@@ -21,7 +21,7 @@ load_dotenv()
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 assert HUGGINGFACE_API_KEY, "HUGGINGFACE_API_KEY environment variable is missing from .env"
 
-HUGGINGFACE_API_MODEL = os.getenv("HUGGINGFACE_API_MODEL", "EleutherAI/gpt-neo-125m")
+HUGGINGFACE_API_MODEL = os.getenv("HUGGINGFACE_API_MODEL", "cerebras/Cerebras-GPT-111M")
 assert HUGGINGFACE_API_MODEL, "HUGGINGFACE_API_MODEL environment variable is missing from .env"
 model_name = HUGGINGFACE_API_MODEL
 tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -142,23 +142,23 @@ def openai_call(
 ):
     while True:
         try:
-            if model.startswith("llama"):
+            if model == ("llama"):
                 # Spawn a subprocess to run llama.cpp
                 cmd = cmd = ["llama/main", "-p", prompt]
                 result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
                 return result.stdout.strip()
             else:
                 # Use chat completion pipeline
-                if model.startswith("gpt-"):
-                    model = f"gpt2-{model[4:]}"
+                #if model.startswith("gpt-"):
+                #    model = f"gpt2-{model[4:]}"
                 tokenizer = AutoTokenizer.from_pretrained(model)
-                if "microsoft" in model:
-                    model = AutoModelForCausalLM.from_pretrained(model, revision="main")
-                    chat_pipeline = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
-                else:
-                    model = AutoModelForCausalLM.from_pretrained(model)
-                    chat_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
-                response = chat_pipeline(prompt, max_length=max_tokens, temperature=temperature)
+                #if "microsoft" in model:
+                #    model = AutoModelForCausalLM.from_pretrained(model, revision="main")
+                #    chat_pipeline = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
+                #else:
+                model = AutoModelForCausalLM.from_pretrained(model)
+                chat_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
+                response = chat_pipeline(prompt, max_new_tokens=max_tokens, temperature=temperature)
                 return response[0]['generated_text'].strip()
         except Exception as e:
             print(f"An error occurred: {e}")
