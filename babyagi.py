@@ -1,31 +1,33 @@
-#!/usr/bin/env python3
 import os
 import subprocess
 import time
 import torch
+import transformers
 from collections import deque
 from typing import Dict, List
-
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, pipeline
-import sqlite3
 import numpy as np
-from scipy.spatial.distance import cosine
 from dotenv import load_dotenv
+from sklearn.neighbors import NearestNeighbors
+from typing import Dict, Any, Type
 
 # Load default environment variables (.env)
 load_dotenv()
 
-# Engine configuration
 
+# Engine configuration
 # API Keys
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 assert HUGGINGFACE_API_KEY, "HUGGINGFACE_API_KEY environment variable is missing from .env"
 
-HUGGINGFACE_API_MODEL = os.getenv("HUGGINGFACE_API_MODEL", "cerebras/Cerebras-GPT-111M")
+HUGGINGFACE_API_MODEL = os.getenv("HUGGINGFACE_API_MODEL", "text-davinci-003")
 assert HUGGINGFACE_API_MODEL, "HUGGINGFACE_API_MODEL environment variable is missing from .env"
+
 model_name = HUGGINGFACE_API_MODEL
+
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModel.from_pretrained(model_name)
+
 if "gpt-4" in HUGGINGFACE_API_MODEL.lower():
     print(
         "\033[91m\033[1m"
@@ -33,23 +35,13 @@ if "gpt-4" in HUGGINGFACE_API_MODEL.lower():
         + "\033[0m\033[0m"
     )
 
-#PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-#assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-#PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
-#assert (
-#    PINECONE_ENVIRONMENT
-#), "PINECONE_ENVIRONMENT environment variable is missing from .env"
-
-
 # Table config
 YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "babyagi")
 assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
 
 # Goal configuation
 OBJECTIVE = os.getenv("OBJECTIVE", "")
-INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", "Develop a list of tasks"))
-
+INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", "Develop a task list"))
 DOTENV_EXTENSIONS = os.getenv("DOTENV_EXTENSIONS", "").split(" ")
 
 # Command line arguments extension
@@ -57,224 +49,157 @@ DOTENV_EXTENSIONS = os.getenv("DOTENV_EXTENSIONS", "").split(" ")
 ENABLE_COMMAND_LINE_ARGS = (
     os.getenv("ENABLE_COMMAND_LINE_ARGS", "false").lower() == "true"
 )
+
 if ENABLE_COMMAND_LINE_ARGS:
     from extensions.argparseext import parse_arguments
-
     OBJECTIVE, INITIAL_TASK, OPENAI_API_MODEL, DOTENV_EXTENSIONS = parse_arguments()
 
 # Load additional environment variables for enabled extensions
 if DOTENV_EXTENSIONS:
     from extensions.dotenvext import load_dotenv_extensions
-
     load_dotenv_extensions(DOTENV_EXTENSIONS)
-
-# TODO: There's still work to be done here to enable people to get
-# defaults from dotenv extensions # but also provide command line
-# arguments to override them
-
-#if "gpt-4" in OPENAI_API_MODEL.lower():
-#    print(
-#        "\033[91m\033[1m"
-#        + "\n*****USING GPT-4. POTENTIALLY EXPENSIVE. MONITOR YOUR COSTS*****"
-#        + "\033[0m\033[0m"
-#    )
-
 # Print OBJECTIVE
 print("\033[94m\033[1m" + "\n*****OBJECTIVE*****\n" + "\033[0m\033[0m")
 print(f"{OBJECTIVE}")
-
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
-
-# Connect to SQLite database
-conn = sqlite3.connect("mydatabase.db")
-c = conn.cursor()
-
-# Create a table if it doesn't exist
-table_name = YOUR_TABLE_NAME
-c.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY, text TEXT, embedding BLOB)")
-
-# Define a function to insert data into the table
-def insert_data(text, embedding):
-    c.execute(f"INSERT INTO {table_name} (text, embedding) VALUES (?, ?)", (text, embedding))
-    conn.commit()
-
+# Create an sklearn NearestNeighbors object with 1 neighbor
+knn = NearestNeighbors(n_neighbors=1)
 # Define a function to retrieve embeddings from the table
-def get_embedding(text):
-    if not text.strip():
-        return None
-    c.execute(f"SELECT embedding FROM {table_name} WHERE text=?", (text,))
-    result = c.fetchone()
-    if result is None:
-        # Embed the text and insert it into the table
-        inputs = tokenizer(text, return_tensors="pt")
-        with torch.no_grad():
-            embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy().tobytes()
-        insert_data(text, embedding)
-        return embedding
-    else:
-        return result[0]
+def get_embedding(prompt: str, knn: NearestNeighbors, model_name: str, dtype: Type[np.float32] = np.float32) -> bytes:
+    model = transformers.AutoModel.from_pretrained(model_name)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 
+    # encode the prompt using the model's tokenizer
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+
+    # generate the embedding using the model
+    with torch.no_grad():
+        embedding = model(**inputs).last_hidden_state.mean(dim=1).numpy()
+
+    # remove the extra dimension from the embedding
+    embedding = np.squeeze(embedding)
+
+    # use the embedding to find the nearest neighbor
+    distances, indices = knn.kneighbors([embedding])
+
+    # return the embedding as bytes
+    return embedding.tobytes()
+# Create the NearestNeighbors index
+print("\033[93m\033[1mCreating the NearestNeighbors index...\033[0m\033[0m")
+dim = 768
+index_params = {
+    'n_jobs': -1,
+    'algorithm': 'auto',
+}
+knn.set_params(**index_params)
+space = knn.fit(np.zeros((1, dim)))
+# Add the initial task embedding to the index
+print("\033[93m\033[1mAdding the initial task embedding to the index...\033[0m\033[0m")
+embedding = get_embedding(INITIAL_TASK, knn, model_name)
 # Task list
 task_list = deque([])
 
-
 def add_task(task: Dict):
     task_list.append(task)
+    print("\033[93m\033[1mAdding task...\033[0m\033[0m")
+    #print(f"DEBUG: task: {task}")
 
+# Define a function to retrieve a task from the task list
+def get_task() -> Dict:
+    if len(task_list) > 0:
+        return task_list.popleft()
+    else:
+        # No tasks left in task list
+        return None
 
-def get_ada_embedding(text):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    if not text.strip():  # check if the input is empty or contains only whitespace
-        return torch.zeros(1, 768)  # return a tensor of zeros
-    input_ids = tokenizer(text, return_tensors='pt', truncation=True, padding=True)['input_ids']
-    model = AutoModel.from_pretrained(model_name)
-    with torch.no_grad():
-        embedding = model(input_ids)[0][:, 0, :]
-    return embedding.numpy()
+# Define a function to create a task
+def create_task(prompt: str) -> Dict:
+    task = {
+        "id": len(task_list) + 1,
+        "prompt": prompt,
+        "embedding": get_embedding(prompt, knn, model_name, dtype=np.float32),
+        "status": "open"
+    }
+    print("\033[93m\033[1mCreating task...\033[0m\033[0m")
+    print(f"DEBUG: prompt: {prompt}")
+    return task
 
-
-def openai_call(
-    prompt: str,
-    model: str = model_name,
-    temperature: float = 0.5,
-    max_tokens: int = 100,
-):
-    while True:
-        try:
-            if model == ("llama"):
-                # Spawn a subprocess to run llama.cpp
-                cmd = cmd = ["llama/main", "-p", prompt]
-                result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
-                return result.stdout.strip()
-            else:
-                # Use chat completion pipeline
-                #if model.startswith("gpt-"):
-                #    model = f"gpt2-{model[4:]}"
-                tokenizer = AutoTokenizer.from_pretrained(model)
-                #if "microsoft" in model:
-                #    model = AutoModelForCausalLM.from_pretrained(model, revision="main")
-                #    chat_pipeline = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
-                #else:
-                model = AutoModelForCausalLM.from_pretrained(model)
-                chat_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
-                response = chat_pipeline(prompt, max_new_tokens=max_tokens, temperature=temperature)
-                return response[0]['generated_text'].strip()
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            time.sleep(10)  # Wait 10 seconds and try again
-        else:
+# Define a function to update a task in the task list
+def update_task(task_id: int, status: str):
+    for task in task_list:
+        if task["id"] == task_id:
+            task["status"] = status
             break
 
+# Define a function to calculate the cosine similarity between two embeddings
+def cosine_similarity(embedding1, embedding2):
+    return 1 - cosine(embedding1, embedding2)
 
-def task_creation_agent(
-    objective: str, result: Dict, task_description: str, task_list: List[str]
-):
-    prompt = f"""
-    You are an task creation AI that uses the result of an execution agent to create new tasks with the following objective: {objective},
-    The last completed task has the result: {result}.
-    This result was based on this task description: {task_description}. These are incomplete tasks: {', '.join(task_list)}.
-    Based on the result, create new tasks to be completed by the AI system that do not overlap with incomplete tasks.
-    Return the tasks as an array."""
-    response = openai_call(prompt)
-    new_tasks = response.split("\n") if "\n" in response else [response]
-    return [{"task_name": task_name} for task_name in new_tasks]
+# Define a function to find the most similar task to a given prompt
+def find_most_similar_task(prompt: str) -> Dict:
+    prompt_embedding = get_embedding(prompt, knn, model_name, dtype=np.float32)
+    highest_similarity = -1
+    most_similar_task = None
+    for task in task_list:
+        if task["status"] != "open":
+            continue
+        task_embedding = np.frombuffer(task["embedding"], dtype=np.float32)
+        similarity = cosine_similarity(prompt_embedding, task_embedding)
+        print(f"DEBUG: task: {task}")
+        if similarity > highest_similarity:
+            highest_similarity = similarity
+            most_similar_task = task
+    return most_similar_task
+#Define a function to perform a task
+def perform_task(task: Dict) -> Dict:
+	print(f"\033[93m\033[1mPerforming task...\033[0m\033[0m")
+	prompt = task["prompt"]
+	response = pipeline(
+		"text-generation",
+		model=model_name,
+		tokenizer=tokenizer,
+		device_map="auto",
+		batch_size=1
+	)
+	completion = response(prompt, max_length=30, temperature=0.5)[0]["generated_text"].strip()
+	task["response"] = completion
+	task["status"] = "completed"
+	print(f"Task completed:\n{task}")
+	return task
 
-
-def prioritization_agent(this_task_id: int):
-    global task_list
-    task_names = [t["task_name"] for t in task_list]
-    next_task_id = int(this_task_id) + 1
-    prompt = f"""
-    You are an task prioritization AI tasked with cleaning the formatting of and reprioritizing the following tasks: {task_names}.
-    Consider the ultimate objective of your team:{OBJECTIVE}.
-    Do not remove any tasks. Return the result as a numbered list, like:
-    #. First task
-    #. Second task
-    Start the task list with number {next_task_id}."""
-    response = openai_call(prompt)
-    new_tasks = response.split("\n")
-    task_list = deque()
-    for task_string in new_tasks:
-        task_parts = task_string.strip().split(".", 1)
-        if len(task_parts) == 2:
-            task_id = task_parts[0].strip()
-            task_name = task_parts[1].strip()
-            task_list.append({"task_id": task_id, "task_name": task_name})
-
-
-def execution_agent(objective: str, task: str) -> str:
-    context = context_agent(query=objective, n=5)
-    # print("\n*******RELEVANT CONTEXT******\n")
-    # print(context)
-    prompt = f"""
-    You are an AI who performs one task based on the following objective: {objective}\n.
-    Take into account these previously completed tasks: {context}\n.
-    Your task: {task}\nResponse:"""
-    return openai_call(prompt, temperature=0.7, max_tokens=2000)
-
-
-def context_agent(query: str, n: int):
-    query_embedding = get_embedding(query)
-    # Retrieve all embeddings from the database
-    c.execute(f"SELECT text, embedding FROM {table_name}")
-    rows = c.fetchall()
-    # Calculate cosine similarity between query and all embeddings
-    similarities = [(row[0], 1 - cosine(np.frombuffer(query_embedding), np.frombuffer(row[1]))) for row in rows]
-    # Sort results by similarity
-    sorted_results = sorted(similarities, key=lambda x: x[1], reverse=True)
-    # Return top n tasks
-    return [result[0] for result in sorted_results[:n]]
-
-# Add the first task
-first_task = {"task_id": 1, "task_name": INITIAL_TASK}
-
-add_task(first_task)
-# Main loop
-task_id_counter = 1
-while True:
-    if task_list:
-        # Print the task list
-        print("\033[95m\033[1m" + "\n*****TASK LIST*****\n" + "\033[0m\033[0m")
-        for t in task_list:
-            print(str(t["task_id"]) + ": " + t["task_name"])
-
-        # Step 1: Pull the first task
-        task = task_list.popleft()
-        print("\033[92m\033[1m" + "\n*****NEXT TASK*****\n" + "\033[0m\033[0m")
-        print(str(task["task_id"]) + ": " + task["task_name"])
-
-        # Send to execution function to complete the task based on the context
-        result = execution_agent(OBJECTIVE, task["task_name"])
-        this_task_id = int(task["task_id"])
-        print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
-        print(result)
-
-        # Step 2: Enrich result and store in Pinecone
-        enriched_result = {
-            "data": result
-        }  # This is where you should enrich the result if needed
-        result_id = f"result_{task['task_id']}"
-        vector = get_ada_embedding(
-            enriched_result["data"]
-        )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
-            [(result_id, vector, {"task": task["task_name"], "result": result})],
-	    namespace=OBJECTIVE
-        )
-
-        # Step 3: Create new tasks and reprioritize task list
-        new_tasks = task_creation_agent(
-            OBJECTIVE,
-            enriched_result,
-            task["task_name"],
-            [t["task_name"] for t in task_list],
-        )
-
-        for new_task in new_tasks:
-            task_id_counter += 1
-            new_task.update({"task_id": task_id_counter})
+#Define the main function to run the program
+def main():
+    # Seed the task list with the initial task
+    initial_task = create_task(INITIAL_TASK)
+    add_task(initial_task)
+    # Loop indefinitely until there are no more tasks
+    print("DEBUG: Entering infinite loop")
+    task_performed = False  # flag to check if any task has ever been performed
+    while True:
+        task = get_task()
+        if task is None:
+            # No more tasks
+            break
+        # Find the most similar task to the prompt
+        most_similar_task = find_most_similar_task(task["prompt"])
+        print(f"DEBUG: most_similar_task: {most_similar_task}")
+        if most_similar_task is None and not task_performed:
+            # No similar task found and no task has ever been performed, create a new one
+            new_task = create_task(task["prompt"])
             add_task(new_task)
-        prioritization_agent(this_task_id)
+            perform_task(new_task)
+            update_task(task["id"], "duplicate")
+        elif most_similar_task is None and task_performed:
+            # No similar task found but a task has already been performed, don't create a new one
+            update_task(task["id"], "duplicate")
+        else:
+            # Perform the most similar task
+            if not most_similar_task.get("performed", False):
+                perform_task(most_similar_task)
+                update_task(most_similar_task["id"], "completed")
+            update_task(task["id"], "completed")
+            task_performed = True  # set the flag to True
 
-    time.sleep(1)  # Sleep before checking the task list again
+
+if __name__ == '__main__':
+	main()
