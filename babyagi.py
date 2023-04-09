@@ -2,11 +2,14 @@
 import os
 import subprocess
 import time
+import torch
 from collections import deque
 from typing import Dict, List
 
-import openai
-import pinecone
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM, pipeline
+import sqlite3
+import numpy as np
+from scipy.spatial.distance import cosine
 from dotenv import load_dotenv
 
 # Load default environment variables (.env)
@@ -15,34 +18,37 @@ load_dotenv()
 # Engine configuration
 
 # API Keys
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-assert OPENAI_API_KEY, "OPENAI_API_KEY environment variable is missing from .env"
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
+assert HUGGINGFACE_API_KEY, "HUGGINGFACE_API_KEY environment variable is missing from .env"
 
-OPENAI_API_MODEL = os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo")
-assert OPENAI_API_MODEL, "OPENAI_API_MODEL environment variable is missing from .env"
-
-if "gpt-4" in OPENAI_API_MODEL.lower():
+HUGGINGFACE_API_MODEL = os.getenv("HUGGINGFACE_API_MODEL", "EleutherAI/gpt-neo-125m")
+assert HUGGINGFACE_API_MODEL, "HUGGINGFACE_API_MODEL environment variable is missing from .env"
+model_name = HUGGINGFACE_API_MODEL
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name)
+if "gpt-4" in HUGGINGFACE_API_MODEL.lower():
     print(
         "\033[91m\033[1m"
         + "\n*****USING GPT-4. POTENTIALLY EXPENSIVE. MONITOR YOUR COSTS*****"
         + "\033[0m\033[0m"
     )
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
+#PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
+#assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
 
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
-assert (
-    PINECONE_ENVIRONMENT
-), "PINECONE_ENVIRONMENT environment variable is missing from .env"
+#PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
+#assert (
+#    PINECONE_ENVIRONMENT
+#), "PINECONE_ENVIRONMENT environment variable is missing from .env"
+
 
 # Table config
-YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
+YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "babyagi")
 assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
 
 # Goal configuation
 OBJECTIVE = os.getenv("OBJECTIVE", "")
-INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", ""))
+INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", "Develop a list of tasks"))
 
 DOTENV_EXTENSIONS = os.getenv("DOTENV_EXTENSIONS", "").split(" ")
 
@@ -66,12 +72,12 @@ if DOTENV_EXTENSIONS:
 # defaults from dotenv extensions # but also provide command line
 # arguments to override them
 
-if "gpt-4" in OPENAI_API_MODEL.lower():
-    print(
-        "\033[91m\033[1m"
-        + "\n*****USING GPT-4. POTENTIALLY EXPENSIVE. MONITOR YOUR COSTS*****"
-        + "\033[0m\033[0m"
-    )
+#if "gpt-4" in OPENAI_API_MODEL.lower():
+#    print(
+#        "\033[91m\033[1m"
+#        + "\n*****USING GPT-4. POTENTIALLY EXPENSIVE. MONITOR YOUR COSTS*****"
+#        + "\033[0m\033[0m"
+#    )
 
 # Print OBJECTIVE
 print("\033[94m\033[1m" + "\n*****OBJECTIVE*****\n" + "\033[0m\033[0m")
@@ -79,22 +85,34 @@ print(f"{OBJECTIVE}")
 
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
-# Configure OpenAI and Pinecone
-openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+# Connect to SQLite database
+conn = sqlite3.connect("mydatabase.db")
+c = conn.cursor()
 
-# Create Pinecone index
+# Create a table if it doesn't exist
 table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        table_name, dimension=dimension, metric=metric, pod_type=pod_type
-    )
+c.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (id INTEGER PRIMARY KEY, text TEXT, embedding BLOB)")
 
-# Connect to the index
-index = pinecone.Index(table_name)
+# Define a function to insert data into the table
+def insert_data(text, embedding):
+    c.execute(f"INSERT INTO {table_name} (text, embedding) VALUES (?, ?)", (text, embedding))
+    conn.commit()
+
+# Define a function to retrieve embeddings from the table
+def get_embedding(text):
+    if not text.strip():
+        return None
+    c.execute(f"SELECT embedding FROM {table_name} WHERE text=?", (text,))
+    result = c.fetchone()
+    if result is None:
+        # Embed the text and insert it into the table
+        inputs = tokenizer(text, return_tensors="pt")
+        with torch.no_grad():
+            embedding = model(**inputs).last_hidden_state.mean(dim=1).squeeze().numpy().tobytes()
+        insert_data(text, embedding)
+        return embedding
+    else:
+        return result[0]
 
 # Task list
 task_list = deque([])
@@ -105,15 +123,20 @@ def add_task(task: Dict):
 
 
 def get_ada_embedding(text):
-    text = text.replace("\n", " ")
-    return openai.Embedding.create(input=[text], model="text-embedding-ada-002")[
-        "data"
-    ][0]["embedding"]
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    if not text.strip():  # check if the input is empty or contains only whitespace
+        return torch.zeros(1, 768)  # return a tensor of zeros
+    input_ids = tokenizer(text, return_tensors='pt', truncation=True, padding=True)['input_ids']
+    model = AutoModel.from_pretrained(model_name)
+    with torch.no_grad():
+        embedding = model(input_ids)[0][:, 0, :]
+    return embedding.numpy()
 
 
 def openai_call(
     prompt: str,
-    model: str = OPENAI_API_MODEL,
+    model: str = model_name,
     temperature: float = 0.5,
     max_tokens: int = 100,
 ):
@@ -124,34 +147,21 @@ def openai_call(
                 cmd = cmd = ["llama/main", "-p", prompt]
                 result = subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
                 return result.stdout.strip()
-            elif not model.startswith("gpt-"):
-                # Use completion API
-                response = openai.Completion.create(
-                    engine=model,
-                    prompt=prompt,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                )
-                return response.choices[0].text.strip()
             else:
-                # Use chat completion API
-                messages = [{"role": "user", "content": prompt}]
-                response = openai.ChatCompletion.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    n=1,
-                    stop=None,
-                )
-                return response.choices[0].message.content.strip()
-        except openai.error.RateLimitError:
-            print(
-                "The OpenAI API rate limit has been exceeded. Waiting 10 seconds and trying again."
-            )
+                # Use chat completion pipeline
+                if model.startswith("gpt-"):
+                    model = f"gpt2-{model[4:]}"
+                tokenizer = AutoTokenizer.from_pretrained(model)
+                if "microsoft" in model:
+                    model = AutoModelForCausalLM.from_pretrained(model, revision="main")
+                    chat_pipeline = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
+                else:
+                    model = AutoModelForCausalLM.from_pretrained(model)
+                    chat_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer)
+                response = chat_pipeline(prompt, max_length=max_tokens, temperature=temperature)
+                return response[0]['generated_text'].strip()
+        except Exception as e:
+            print(f"An error occurred: {e}")
             time.sleep(10)  # Wait 10 seconds and try again
         else:
             break
@@ -205,13 +215,16 @@ def execution_agent(objective: str, task: str) -> str:
 
 
 def context_agent(query: str, n: int):
-    query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=n, include_metadata=True, namespace=OBJECTIVE)
-    # print("***** RESULTS *****")
-    # print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
-    return [(str(item.metadata["task"])) for item in sorted_results]
-
+    query_embedding = get_embedding(query)
+    # Retrieve all embeddings from the database
+    c.execute(f"SELECT text, embedding FROM {table_name}")
+    rows = c.fetchall()
+    # Calculate cosine similarity between query and all embeddings
+    similarities = [(row[0], 1 - cosine(np.frombuffer(query_embedding), np.frombuffer(row[1]))) for row in rows]
+    # Sort results by similarity
+    sorted_results = sorted(similarities, key=lambda x: x[1], reverse=True)
+    # Return top n tasks
+    return [result[0] for result in sorted_results[:n]]
 
 # Add the first task
 first_task = {"task_id": 1, "task_name": INITIAL_TASK}
